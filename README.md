@@ -4,9 +4,60 @@ Backfill Home Assistant utility statistics from meter readings and billing data.
 
 大阪ガスの請求CSVと手動メーター観測から、過去の使用量を1時間単位で線形補間する外部CLIです。HACS integrationではありません。現時点ではgasのみ対応し、水道対応は設計段階です。
 
-## 実行
+## インストール
 
-Python 3.10以上（`zoneinfo`用のタイムゾーンデータが必要）。プレビューとテストには外部Pythonパッケージは不要です。DB書き込みには `python3 -m pip install -r requirements.txt` を実行してください。
+Python 3.10以上、Git、Pythonの`venv`・`pip`、`Asia/Tokyo`のタイムゾーンデータが必要です。Home Assistantの外部で実行するCLIなので、HACSへの登録やHAのカスタムコンポーネント配置は不要です。
+
+### 取得と仮想環境の作成
+
+Linux / macOSのシェルで以下を実行します。`master`は変更前v4の保存用なので、現在の実装がある `refactor/external-statistics` ブランチを指定してください。
+
+```sh
+git clone --branch refactor/external-statistics https://github.com/sakakinox/ha-utility-estimator.git
+cd ha-utility-estimator
+python3 --version
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
+
+このブランチがリモートへpushされていることが前提です。すでにローカルに作業ブランチがある場合はcloneを省略し、そのリポジトリ内で仮想環境の作成から実行してください。Pythonが3.10未満の場合は、3.10以上の実行ファイルを指定して仮想環境を作成します。
+
+Debian / Ubuntu系で`venv`やタイムゾーンデータが不足する場合は、次でOSパッケージを追加できます。Pythonのバージョンは別途確認してください。
+
+```sh
+sudo apt update
+sudo apt install git python3 python3-venv python3-pip tzdata
+```
+
+`requirements.txt`はPostgreSQL書き込み用の`psycopg2-binary`を導入します。プレビュー作成と標準のテストだけなら、この依存関係のインストールは省略できます。OSにタイムゾーンデータがない環境では、仮想環境内で `python3 -m pip install tzdata` を実行してください。
+
+### インストール確認
+
+```sh
+python3 -c "from zoneinfo import ZoneInfo; print(ZoneInfo('Asia/Tokyo'))"
+python3 gas_usage_interpolator.py --help
+python3 -m unittest discover -s tests -v
+```
+
+これらの確認ではHome AssistantのDBへ接続・書き込みしません。新しいシェルで実行するときは、リポジトリへ移動して `. .venv/bin/activate` を再実行します。
+
+### PostgreSQL接続の設定
+
+`--commit`を使う場合は、対象recorder DBに接続できる環境で接続先と認証情報を設定します。以下は接続先の例です。実際のホスト名・DB名・ユーザー名に置き換えてください。
+
+```sh
+export PGHOST=127.0.0.1
+export PGPORT=5432
+export PGDATABASE=homeassistant
+export PGUSER=homeassistant
+```
+
+パスワードはlibpqのパスワードファイル（`~/.pgpass`、Unixでは権限`0600`）または実行環境の`PGPASSWORD`で渡します。`DATABASE_URL`を設定した場合は、上記の個別設定より優先されます。DBユーザーには対象テーブルのSELECT・INSERT・UPDATEと、ID採番に必要なシーケンス権限が必要です。
+
+まず以下の実行例でプレビューを確認し、[DB書き込みの注意点](#external-statisticsとdbの注意点)を確認してから`--commit`を使用してください。
+
+## 実行
 
 ```sh
 # 最初に基準点から連続する請求履歴全体を読み込む
