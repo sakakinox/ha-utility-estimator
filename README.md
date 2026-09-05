@@ -2,7 +2,7 @@
 
 Backfill Home Assistant utility statistics from meter readings and billing data.
 
-大阪ガスの請求CSVと手動メーター観測から、過去の使用量を1時間単位で線形補間する外部CLIです。HACS integrationではありません。現時点ではgasのみ対応し、水道対応は設計段階です。
+大阪ガスの請求CSVと手動メーター観測から、過去の使用量を1時間単位で線形補間する外部CLIです。HACS integrationではありません。大阪ガスCSVと、コマンドラインから入力する水道の検針票に対応しています。
 
 ## インストール
 
@@ -72,6 +72,53 @@ python3 gas_usage_interpolator.py 459.439 --at 2026-09-04T13:53:57 --commit
 # 新しいCSVが来たら、基準点からの履歴全体を再投入
 python3 gas_usage_interpolator.py gas/billing.csv --commit
 ```
+
+### 水道の検針票を入力する
+
+CSVを用意せず、前回・今回の検針日とメーター指針を入力します。
+
+```sh
+python3 utility_interpolator.py water \
+  --start 2026-05-20 --end 2026-07-03 \
+  --previous 935 --current 947 --usage 12
+```
+
+`--usage`は省略可能です。指定した場合は `今回指針 - 前回指針` と一致するか検証します。指針と使用量の単位はm³です。日付だけなら **その日の12:00 JST** と仮定します。正確な時刻が分かる場合は `--start 2026-05-20T10:30 --end 2026-07-03T11:15` のように指定してください。水道ではガスの「終了日の翌日」規則を使いません。
+
+この例では5/20 12:00から7/3 12:00までの1057点を生成し、最初はstate=935・sum=0、最後はstate=947・sum=12です。非正時の検針時刻も内部アンカーとして保持し、出力は正時だけにします。
+
+履歴は `water_billing_history.json`、プレビューは `water_hourly_preview.csv` に保存します。入力ファイルは不要です。初回の前回指針をsumの基準として使い、次回以降も維持します。
+
+```sh
+# 保存済み履歴を全件DBに反映
+python3 utility_interpolator.py water --commit
+
+# 次の検針票を追加する例
+python3 utility_interpolator.py water \
+  --start 2026-07-03 --end 2026-08-20 \
+  --previous 947 --current 962 --usage 15
+
+# DBに書かず、保存済み履歴からプレビューを再生成
+python3 utility_interpolator.py water
+```
+
+前回の終端時刻・指針と、次の期間の開始時刻・指針が一致する必要があります。同じ期間・指針の再登録は重複せず、異なる指針への訂正、期間の重なり・欠落、過去への追加、減少・負の指針、未来の検針はエラーにします。履歴の訂正・削除やメーター交換への対応は未実装です。
+
+水道の書き込み先は `water_estimator:usage`、表示名は `Water Usage Estimated` です。単位等はガスと共通で、同じtransaction・全行照合・ROLLBACK処理を使用します。手動モードのガスと異なり、水道の `--commit` は常に保存済み履歴全体を書き込みます。
+
+| 水道の設定 | 既定値 |
+| --- | --- |
+| `--history` | `water_billing_history.json` |
+| `--output` | `water_hourly_preview.csv` |
+| `--statistic-id` | `water_estimator:usage` |
+
+別の水道メーターを管理する場合は、3項目すべてを別の値にしてください。水道では `water_estimator:` 名前空間のみ許可し、履歴に保存したstatistic IDと異なるIDへの再利用を拒否します。初回投入後に履歴ファイルを削除・手編集するとDBの既存値との整合性を失うため、履歴もバックアップしてください。
+
+`--commit`なしでも履歴とプレビューは保存します。入力検証の失敗時は両ファイルを変更しません。それぞれのファイルは一時ファイルから置換しますが、2ファイルとDBをまとめたtransactionではありません。DB失敗時も履歴が残るので `water --commit` で再試行できます。同時に複数のCLIを実行しないでください。
+
+ガスも `python3 utility_interpolator.py gas ...` から実行できます。既存の `gas_usage_interpolator.py ...` は引き続き使用できます。各utilityの `--help` で引数を確認できます。
+
+### ガスの設定と共通DB接続
 
 接続には `DATABASE_URL` または `PGHOST` / `PGPORT` / `PGDATABASE` / `PGUSER` / `PGPASSWORD` を使います。未指定時は `127.0.0.1:5432`、DB名・ユーザー名 `homeassistant`。認証情報はリポジトリに保存しないでください。
 
@@ -147,17 +194,16 @@ python3 -m unittest discover -s tests -v
 python3 -m pytest
 ```
 
-補間回帰、CSV境界・エンコーディング・スキップ行、空期間、重複時刻、観測矛盾、未来・非有限値、観測再登録、失敗時のファイル維持、終了コード、SQL再投入とtransaction制御を検証します。DBテストは接続をモックしており、実PostgreSQLの統合テストは未実施です。
+補間回帰、CSV境界・エンコーディング・スキップ行、空期間、重複時刻、観測矛盾、未来・非有限値、観測再登録、失敗時のファイル維持、終了コード、SQL再投入とtransaction制御を検証します。水道の検針票入力、時刻境界、履歴再登録、sum基準の維持、ガスとのID分離も検証します。DBテストは接続をモックしており、実PostgreSQLの統合テストは未実施です。
 
 ## 次の段階: gas / water共通化案
 
-今回の変更ではv4の単一ファイルとCLIを維持しています。以下をそれぞれテスト付きの小さな変更として進めます。
+水道CLIと `utility_interpolator.py gas / water` を追加しました。ガスの既存CLIと補間・DB処理を維持し、水道から共用しています。次は以下を小さな変更として進めます。
 
 1. `providers/osakagas.py`へCSVのデコードとパースを抽出。大阪ガス固有の「終了日の翌日12時」規則はproviderに残す。
 2. `MeterPoint`と開始・終了の正確な時刻および使用量を持つ汎用期間型、補間・制約検証を共通モジュールへ移す。単位名を含む既存CSV形式は互換読み込みを維持する。
 3. `writers/postgres.py`へDB処理を抽出し、`write(series, metadata, baseline)`の境界を作る。将来HAの正式な取り込み経路を使うwriterを差し替え可能にする。
 4. utility別のanchor、timezone、単位、statistic ID、保存先を設定ファイルへ移す。CLIで上書き可能にし、基準点をプレビューに記録・照合する。
-5. `providers/manual_billing.py`で水道検針票を入力する。例の935→947、使用量12を検証し、検針日時間の区間に変換する。水道の5/20～7/3にはガスの翌日12時ルールを流用せず、検針時刻または設定された時刻を明示する。
-6. `utility_interpolator.py gas ...` / `water ...`を追加し、既存ガスCLIは互換入口として残す。
+5. 現在の `water_usage_interpolator.py` の検針票検証を `providers/manual_billing.py` に抽出し、履歴訂正やメーター交換の取り扱いを設計する。
 
 実DB統合テスト、設定変更・範囲短縮の安全な取り扱い、ローカルファイルの原子的置換と同時実行ロックも次段階の対象です。

@@ -45,3 +45,17 @@ DBへの変更は `--commit` 指定時だけです。書き込み先はexternal 
 ## テストの範囲
 
 `DatabaseTests`はDB接続をモックしてSQLとtransaction制御を検証します。実PostgreSQLとの互換性確認は別途必要です。
+
+## 水道CLI
+
+`utility_interpolator.main`はutility名を解釈し、ガスの既存CLIまたは `water_usage_interpolator.main` に残りの引数を渡します。ガス側の `main(argv)` は引数未指定時に従来どおりコマンドラインを読みます。
+
+水道の `parse_reading_time` は日付のみの入力を当日の12:00 JSTに変換し、日時指定は正確に保持します。`validate_bill`は非負・単調増加の指針、過去の正しい期間、指針差と請求使用量の一致を確認します。
+
+`build_series`は初回の前回指針を基準値とし、登録順に隣接する検針期間の境界時刻・指針を照合します。ガスの `interpolate_between` と `validate_hourly_points` を再利用し、共有する正時境界の重複を除外します。大阪ガスの `BillingPeriod` は使いません。
+
+`add_bill`は同一期間・同一指針なら既存履歴を返し、異なる指針の再登録を拒否します。新規期間は末尾に連続する場合だけ追加できます。`load_history`はJSONのversion・statistic IDと履歴全体を検証します。基準点をずらさないよう、過去への追加は許可しません。
+
+`atomic_write`は同じディレクトリに一時ファイルを作り、書き込み完了後に置換します。水道CLIは全入力検証後に履歴・プレビューを順に保存し、`--commit`指定時に履歴全体をDBに反映します。並行実行のロックや複数ファイルの一括transactionは提供しません。
+
+共用する `commit_statistics` と `get_metadata_id` にはmetadata表示名の引数を追加しています。既定はガスのまま、水道は `Water Usage Estimated` を渡します。水道は `water_estimator:` 名前空間と履歴内のID照合で誤投入を防ぎます。
