@@ -771,7 +771,7 @@ def validate_statistic_id(statistic_id: str) -> str:
     return source
 
 
-def get_metadata_id(conn, statistic_id: str) -> int:
+def get_metadata_id(conn, statistic_id: str, name: str = "Gas Usage Estimated") -> int:
     source = validate_statistic_id(statistic_id)
     expected = (source, "m³", False, True, 0, "volume")
     with conn.cursor() as cur:
@@ -783,7 +783,7 @@ def get_metadata_id(conn, statistic_id: str) -> int:
             VALUES (%s, %s, %s, false, true, %s, 0, 'volume')
             ON CONFLICT (statistic_id) DO NOTHING
             """,
-            (statistic_id, source, "m³", "Gas Usage Estimated"),
+            (statistic_id, source, "m³", name),
         )
         cur.execute(
             """
@@ -869,6 +869,7 @@ def commit_statistics(
     points: Sequence[MeterPoint],
     base_value: float,
     statistic_id: str,
+    name: str = "Gas Usage Estimated",
 ) -> None:
 
     validate_statistic_id(statistic_id)
@@ -885,6 +886,7 @@ def commit_statistics(
         metadata_id = get_metadata_id(
             conn,
             statistic_id,
+            name,
         )
 
         print()
@@ -1147,7 +1149,7 @@ def csv_mode(
     return 0
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         description=(
@@ -1229,7 +1231,7 @@ def main() -> int:
         ),
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     validate_statistic_id(args.statistic_id)
     require_finite(args.anchor_value)
 
