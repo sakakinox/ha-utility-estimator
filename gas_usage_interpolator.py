@@ -122,6 +122,25 @@ JP_PERIOD_RE = re.compile(
 # 共通
 # ============================================================
 
+def require_finite(value: float) -> None:
+    if not math.isfinite(value):
+        raise ValueError("meter and usage values must be finite")
+
+
+def validate_observations(points: Sequence[MeterPoint]) -> None:
+    seen = set()
+    for point in points:
+        require_finite(point.value)
+        if point.ts > datetime.now(JST):
+            raise ValueError("future observations are not supported")
+        if point.ts in seen:
+            raise ValueError(f"duplicate observation timestamp: {point.ts.isoformat()}")
+        seen.add(point.ts)
+    ordered = sorted(points, key=lambda point: point.ts)
+    if any(b.value < a.value for a, b in zip(ordered, ordered[1:])):
+        raise ValueError("manual meter values must not decrease")
+
+
 def parse_datetime_jst(text: str) -> datetime:
     ts = datetime.fromisoformat(text)
 
@@ -229,6 +248,9 @@ def load_osakagas_csv(
 
         start_date, end_date = parsed
         usage_m3 = float(usage_text)
+        require_finite(usage_m3)
+        if usage_m3 < 0 or end_date < start_date:
+            raise ValueError("invalid billing period or negative usage")
 
         days = int(days_text) if days_text.isdigit() else None
 
@@ -294,7 +316,9 @@ def save_manual_observation(
     保存したら True。
     同一時刻・同一値が既にある場合は False（冪等）。
     """
+    validate_observations([MeterPoint(ts, value)])
     previous = load_manual_observations(observations_file)
+    validate_observations(previous)
 
     for point in previous:
         if point.ts == ts:
@@ -366,6 +390,10 @@ def interpolate_between(
     start/endや途中観測点は正時でなくてもよい。
     出力は原則として正時だけ。
     """
+    require_finite(start.value)
+    require_finite(end.value)
+    observations = list(observations)
+    validate_observations(observations)
     if start.ts >= end.ts:
         raise ValueError(
             "start timestamp must be before end timestamp"
@@ -501,6 +529,11 @@ def build_period_series(
         source=f"csv:{period.bill_month}:end",
     )
 
+    for point in manual_observations:
+        for boundary in (start, end):
+            if point.ts == boundary.ts and not math.isclose(point.value, boundary.value, rel_tol=0, abs_tol=1e-9):
+                raise ValueError("manual observation conflicts with CSV boundary")
+
     inside = [
         point
         for point in manual_observations
@@ -534,6 +567,8 @@ def build_csv_series(
     anchor_value: float,
 ) -> list[MeterPoint]:
 
+    require_finite(anchor_value)
+    validate_observations(manual_observations)
     current_ts = anchor_ts
     current_value = anchor_value
     all_points: list[MeterPoint] = []
@@ -583,6 +618,7 @@ def extend_series_with_manual_tail(
       merged_points
       latest_exact_observation
     """
+    validate_observations(manual_observations)
     if not points:
         return list(points), None
 
@@ -766,6 +802,9 @@ def validate_hourly_points(
     seen: set[datetime] = set()
 
     for point in hourly:
+        require_finite(point.value)
+        if point.ts > datetime.now(JST):
+            raise ValueError("future statistics are not supported")
         if point.ts in seen:
             raise ValueError(
                 f"duplicate hourly timestamp detected: {point.ts.isoformat()}"
@@ -937,6 +976,7 @@ def commit_statistics(
 ) -> None:
 
     validate_statistic_id(statistic_id)
+    require_finite(base_value)
     hourly_points = validate_hourly_points(points)
     if hourly_points[0].value < base_value:
         raise ValueError("meter state is below sum baseline")
@@ -991,25 +1031,12 @@ def record_mode(
 ) -> int:
 
     value = float(args.target)
+    require_finite(value)
 
     if args.at:
         ts = parse_datetime_jst(args.at)
     else:
         ts = datetime.now(JST)
-
-    saved = save_manual_observation(
-        value,
-        ts,
-        args.observations_file,
-    )
-
-    print(
-        "Manual gas-meter observation "
-        + ("recorded" if saved else "already recorded")
-    )
-    print(f"  time : {ts.isoformat()}")
-    print(f"  value: {value:.3f} m3")
-    print(f"  file : {args.observations_file}")
 
     preview_points = load_preview_points(
         args.output
@@ -1026,10 +1053,28 @@ def record_mode(
         args.observations_file
     )
 
+    endpoint = find_latest_csv_endpoint(preview_points)
+    if endpoint is None or ts <= endpoint.ts:
+        raise ValueError("manual mode requires a timestamp after the latest CSV endpoint")
+    existing = [p for p in manual if p.ts == ts]
+    if existing and any(abs(p.value - value) >= 1e-9 for p in existing):
+        raise ValueError("manual observation already exists with different value")
+    if not existing:
+        if manual and ts < manual[-1].ts:
+            raise ValueError("new observation is older than the latest manual observation")
+        manual.append(MeterPoint(ts, value, "manual"))
+    validate_observations(manual)
+
     rebuilt, latest_observation = rebuild_manual_tail_from_preview(
         preview_points,
         manual,
     )
+
+    validate_hourly_points(rebuilt)
+    saved = save_manual_observation(value, ts, args.observations_file)
+    print("Manual gas-meter observation " + ("recorded" if saved else "already recorded"))
+    print(f"  time : {ts.isoformat()}")
+    print(f"  value: {value:.6f} m3")
 
     write_hourly_csv(
         rebuilt,
@@ -1160,6 +1205,7 @@ def csv_mode(
         manual,
     )
 
+    validate_hourly_points(points)
     write_hourly_csv(
         points,
         args.output,
@@ -1300,6 +1346,7 @@ def main() -> int:
 
     args = parser.parse_args()
     validate_statistic_id(args.statistic_id)
+    require_finite(args.anchor_value)
 
     if looks_like_number(args.target):
         return record_mode(args)
@@ -1316,3 +1363,4 @@ if __name__ == "__main__":
             f"ERROR: {exc}",
             file=sys.stderr,
         )
+        sys.exit(1)

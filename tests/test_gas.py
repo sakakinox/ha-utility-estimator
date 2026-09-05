@@ -74,6 +74,51 @@ class GasTests(unittest.TestCase):
             self.assertEqual(encoding, 'cp932')
 
 
+class SafetyTests(unittest.TestCase):
+    def test_boundary_conflicts(self):
+        for ts, value in [('2026-06-25T12:00', 413), ('2026-07-25T12:00', 438), ('2026-08-26T12:00', 452)]:
+            with self.subTest(ts=ts), self.assertRaises(ValueError):
+                gas.build_csv_series(periods(), [point(ts, value)], gas.parse_datetime_jst(gas.DEFAULT_ANCHOR_TIME), 412)
+
+    def test_invalid_periods(self):
+        for history in [periods()[::-1], periods() + [periods()[1]]]:
+            with self.assertRaises(ValueError):
+                gas.build_csv_series(history, [], gas.parse_datetime_jst(gas.DEFAULT_ANCHOR_TIME), 412)
+
+    def test_invalid_values_and_future(self):
+        for p in [point('2026-09-04T13:00', float('nan')), point('2026-09-04T13:00', float('inf')), point('2999-01-01T00:00', 500)]:
+            with self.assertRaises(ValueError):
+                gas.validate_hourly_points([p])
+
+    def test_multiple_non_hourly_anchors(self):
+        base = [point('2026-09-01T12:00', 453)]
+        manual = [point('2026-09-01T12:15', 454), point('2026-09-01T12:45', 455), point('2026-09-01T13:15', 457)]
+        result, latest = gas.extend_series_with_manual_tail(base, manual)
+        self.assertEqual([p.value for p in result], [453, 456])
+        self.assertEqual(latest, manual[-1])
+
+    def test_manual_error_does_not_save(self):
+        from argparse import Namespace
+        with tempfile.TemporaryDirectory() as folder:
+            preview = Path(folder) / 'preview.csv'
+            observations = Path(folder) / 'manual.csv'
+            series = gas.build_csv_series(periods(), [], gas.parse_datetime_jst(gas.DEFAULT_ANCHOR_TIME), 412)
+            gas.write_hourly_csv(series, preview, 412)
+            before = preview.read_bytes()
+            args = Namespace(target='450', at='2026-09-04T13:53:57', output=preview,
+                             observations_file=observations, anchor_value=412, commit=False)
+            with self.assertRaises(ValueError):
+                gas.record_mode(args)
+            self.assertFalse(observations.exists())
+            self.assertEqual(preview.read_bytes(), before)
+
+    def test_cli_error_exit(self):
+        import subprocess
+        import sys
+        result = subprocess.run([sys.executable, gas.__file__, 'missing.csv'], capture_output=True)
+        self.assertEqual(result.returncode, 1)
+
+
 class DatabaseTests(unittest.TestCase):
     """Mock the DB boundary; real PostgreSQL compatibility remains a separate check."""
     def connection(self):
