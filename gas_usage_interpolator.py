@@ -1,44 +1,4 @@
 #!/usr/bin/env python3
-# Based on VERSION: 2026-09-04-v4; external statistics edition
-"""
-Home Assistant gas usage interpolator / statistics backfiller.
-
-Usage
-=====
-
-CSVを解析して、1時間按分のプレビューを作る:
-    python3 gas_usage_interpolator.py gas/0904.csv
-
-CSVを解析して Home Assistant の PostgreSQL statistics に反映:
-    python3 gas_usage_interpolator.py gas/0904.csv --commit
-
-現在の実ガスメーター値を記録し、
-直前の既知点から現在までを1時間単位で按分:
-    python3 gas_usage_interpolator.py 459.439
-
-観測時刻を明示:
-    python3 gas_usage_interpolator.py 459.439 --at 2026-09-04T13:45
-
-手動観測の按分結果も PostgreSQL に反映:
-    python3 gas_usage_interpolator.py 459.439 --at 2026-09-04T13:45 --commit
-
-重要な考え方
-============
-
-- gas_estimator:usage の state はメーター絶対値、sum は基準点からの使用量。
-- CSVは期間内の増加量だけを持つ。
-- 手動観測は、その時刻のガスメーター絶対値。
-- CSV期間は:
-      開始日 12:00 JST <= t < 終了日の翌日 12:00 JST
-- CSV期間内に手動観測があれば、その観測値をアンカーとして再按分。
-- 最新CSVの終了後に手動観測した場合は、
-      最新CSV終端 -> 手動観測時刻
-  を線形按分して現在まで統計を延長する。
-- 将来その期間を含むCSVが来たら、CSV総量を正として再按分する。
-- PostgreSQLへの書き込みは --commit のときだけ。
-- statistics_short_term は触らない。
-- 通常sensor/helper、Home Assistant REST APIには依存しない。
-"""
 
 from __future__ import annotations
 
@@ -56,14 +16,9 @@ from typing import Iterable, Sequence
 from zoneinfo import ZoneInfo
 
 
-# ============================================================
-# 固定設定
-# ============================================================
-
 JST = ZoneInfo("Asia/Tokyo")
 BOUNDARY_TIME = time(12, 0)
 
-# 新居のみの信頼できる起点
 DEFAULT_ANCHOR_TIME = "2026-06-25T12:00"
 DEFAULT_ANCHOR_VALUE = 412.0
 
@@ -72,10 +27,6 @@ DEFAULT_OUTPUT_FILE = Path("gas_hourly_preview.csv")
 
 DEFAULT_STATISTIC_ID = "gas_estimator:usage"
 
-
-# ============================================================
-# データ型
-# ============================================================
 
 @dataclass(frozen=True)
 class MeterPoint:
@@ -102,8 +53,6 @@ class BillingPeriod:
 
     @property
     def end_ts(self) -> datetime:
-        # CSVの両端日を含む。
-        # 内部表現は [start, end)。
         return datetime.combine(
             self.end_date + timedelta(days=1),
             BOUNDARY_TIME,
@@ -117,10 +66,6 @@ JP_PERIOD_RE = re.compile(
     r"(?P<ey>\d{4})年(?P<em>\d{1,2})月(?P<ed>\d{1,2})日"
 )
 
-
-# ============================================================
-# 共通
-# ============================================================
 
 def require_finite(value: float) -> None:
     if not math.isfinite(value):
@@ -165,10 +110,6 @@ def is_exact_hour(ts: datetime) -> bool:
         and ts.microsecond == 0
     )
 
-
-# ============================================================
-# 大阪ガスCSV
-# ============================================================
 
 def decode_csv_file(path: Path) -> tuple[str, str]:
     raw = path.read_bytes()
@@ -222,7 +163,6 @@ def load_osakagas_csv(
     text, encoding = decode_csv_file(path)
     stream = io.StringIO(text)
 
-    # 大阪ガスCSVの先頭説明行
     next(stream, None)
 
     reader = csv.DictReader(stream)
@@ -277,10 +217,6 @@ def load_osakagas_csv(
     return periods, skipped, encoding
 
 
-# ============================================================
-# 手動ガスメーター観測
-# ============================================================
-
 def load_manual_observations(path: Path) -> list[MeterPoint]:
     if not path.exists():
         return []
@@ -312,10 +248,6 @@ def save_manual_observation(
     ts: datetime,
     observations_file: Path,
 ) -> bool:
-    """
-    保存したら True。
-    同一時刻・同一値が既にある場合は False（冪等）。
-    """
     validate_observations([MeterPoint(ts, value)])
     previous = load_manual_observations(observations_file)
     validate_observations(previous)
@@ -375,21 +307,11 @@ def save_manual_observation(
     return True
 
 
-# ============================================================
-# 按分
-# ============================================================
-
 def interpolate_between(
     start: MeterPoint,
     end: MeterPoint,
     observations: Iterable[MeterPoint] = (),
 ) -> list[MeterPoint]:
-    """
-    start/end間を正時ごとに線形補間する。
-
-    start/endや途中観測点は正時でなくてもよい。
-    出力は原則として正時だけ。
-    """
     require_finite(start.value)
     require_finite(end.value)
     observations = list(observations)
@@ -470,7 +392,6 @@ def interpolate_between(
                 source=start.source,
             )
         )
-        # start 自体をすでに追加したので、while では次の正時から処理する。
         cursor += timedelta(hours=1)
 
     anchor_index = 0
@@ -495,7 +416,6 @@ def interpolate_between(
 
         cursor += timedelta(hours=1)
 
-    # CSV境界など、終了が正時なら終端も含める。
     if is_exact_hour(end.ts):
         if not result or result[-1].ts != end.ts:
             result.append(
@@ -611,20 +531,12 @@ def extend_series_with_manual_tail(
     points: Sequence[MeterPoint],
     manual_observations: Sequence[MeterPoint],
 ) -> tuple[list[MeterPoint], MeterPoint | None]:
-    """
-    最新CSV終端より後にある手動観測を使い、現在までの系列を延長する。
-
-    戻り値:
-      merged_points
-      latest_exact_observation
-    """
     validate_observations(manual_observations)
     if not points:
         return list(points), None
 
     merged = list(points)
 
-    # CSVモードで作った系列の終端は、最後のCSV確定点。
     base = merged[-1]
 
     tail_observations = [
@@ -651,7 +563,6 @@ def extend_series_with_manual_tail(
             observation,
         )
 
-        # 先頭の正時が既存系列の末尾と重複する場合は除外。
         if (
             merged
             and segment
@@ -661,15 +572,10 @@ def extend_series_with_manual_tail(
 
         merged.extend(segment)
 
-        # 次区間は「実測時刻・実測値」から開始する。
         current_anchor = observation
 
     return merged, tail_observations[-1]
 
-
-# ============================================================
-# Preview CSV
-# ============================================================
 
 def write_hourly_csv(
     points: Sequence[MeterPoint],
@@ -760,7 +666,6 @@ def rebuild_manual_tail_from_preview(
             "Run CSV mode once before recording manual observations."
         )
 
-    # CSV終端より後の既存previewは捨てて、手動観測から毎回再計算。
     base_points = [
         point
         for point in preview_points
@@ -780,14 +685,9 @@ def rebuild_manual_tail_from_preview(
     return rebuilt, latest_observation
 
 
-
 def validate_hourly_points(
     points: Sequence[MeterPoint],
 ) -> list[MeterPoint]:
-    """
-    PostgreSQLへ書く前に、正時系列の重複・並び・欠落を検査する。
-    JSTにはDSTがないため、連続区間は3600秒刻みであることを期待する。
-    """
     hourly = [
         point
         for point in points
@@ -830,10 +730,6 @@ def validate_hourly_points(
 
     return hourly
 
-
-# ============================================================
-# PostgreSQL
-# ============================================================
 
 def import_psycopg2():
     try:
@@ -1022,10 +918,6 @@ def commit_statistics(
         conn.close()
 
 
-# ============================================================
-# CLI modes
-# ============================================================
-
 def record_mode(
     args: argparse.Namespace,
 ) -> int:
@@ -1124,7 +1016,6 @@ def record_mode(
         )
         return 0
 
-    # DBはCSV終端以降だけUPSERTすれば十分。
     tail_points = [
         point
         for point in rebuilt
@@ -1198,8 +1089,6 @@ def csv_mode(
         )
         return 2
 
-    # 最新CSV終端より後に手動観測が既に存在する場合は、
-    # そこまでpreviewを延長する。
     points, latest_tail_observation = extend_series_with_manual_tail(
         points,
         manual,
@@ -1257,10 +1146,6 @@ def csv_mode(
 
     return 0
 
-
-# ============================================================
-# main
-# ============================================================
 
 def main() -> int:
 

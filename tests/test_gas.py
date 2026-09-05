@@ -120,7 +120,6 @@ class SafetyTests(unittest.TestCase):
 
 
 class DatabaseTests(unittest.TestCase):
-    """Mock the DB boundary; real PostgreSQL compatibility remains a separate check."""
     def connection(self):
         from unittest.mock import MagicMock
         conn = MagicMock()
