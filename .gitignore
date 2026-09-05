@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+.env.*
+gas/
+gas_manual_observations.csv
+gas_hourly_preview.csv
