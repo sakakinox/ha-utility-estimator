@@ -7,3 +7,5 @@ __pycache__/
 gas/
 gas_manual_observations.csv
 gas_hourly_preview.csv
+water_billing_history.json
+water_hourly_preview.csv
