@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VERSION: 2026-09-04-v4
+# Based on VERSION: 2026-09-04-v4; external statistics edition
 """
 Home Assistant gas usage interpolator / statistics backfiller.
 
@@ -25,7 +25,7 @@ CSVを解析して Home Assistant の PostgreSQL statistics に反映:
 重要な考え方
 ============
 
-- sensor.gas_usage_estimated は「ガスメーターの累積指針値」。
+- gas_estimator:usage の state はメーター絶対値、sum は基準点からの使用量。
 - CSVは期間内の増加量だけを持つ。
 - 手動観測は、その時刻のガスメーター絶対値。
 - CSV期間は:
@@ -37,7 +37,7 @@ CSVを解析して Home Assistant の PostgreSQL statistics に反映:
 - 将来その期間を含むCSVが来たら、CSV総量を正として再按分する。
 - PostgreSQLへの書き込みは --commit のときだけ。
 - statistics_short_term は触らない。
-- --commit 時は input_number.gas_meter_estimated も実際の最新値へ更新する。
+- 通常sensor/helper、Home Assistant REST APIには依存しない。
 """
 
 from __future__ import annotations
@@ -45,12 +45,10 @@ from __future__ import annotations
 import argparse
 import csv
 import io
-import json
+import math
 import os
 import re
 import sys
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -72,8 +70,7 @@ DEFAULT_ANCHOR_VALUE = 412.0
 DEFAULT_OBSERVATIONS_FILE = Path("gas_manual_observations.csv")
 DEFAULT_OUTPUT_FILE = Path("gas_hourly_preview.csv")
 
-DEFAULT_STATISTIC_ID = "sensor.gas_usage_estimated"
-DEFAULT_HELPER_ENTITY = "input_number.gas_meter_estimated"
+DEFAULT_STATISTIC_ID = "gas_estimator:usage"
 
 
 # ============================================================
@@ -830,28 +827,40 @@ def connect_postgres():
     )
 
 
-def get_metadata_id(
-    conn,
-    statistic_id: str,
-) -> int:
+def validate_statistic_id(statistic_id: str) -> str:
+    if not re.fullmatch(r"[a-z0-9_]+:[a-z0-9_]+", statistic_id):
+        raise ValueError("statistic_id must be external, e.g. gas_estimator:usage")
+    source = statistic_id.split(":", 1)[0]
+    if source == "recorder":
+        raise ValueError("recorder is reserved for entity statistics")
+    return source
 
+
+def get_metadata_id(conn, statistic_id: str) -> int:
+    source = validate_statistic_id(statistic_id)
+    expected = (source, "m³", False, True, 0, "volume")
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT id
-            FROM statistics_meta
-            WHERE statistic_id = %s
+            INSERT INTO statistics_meta
+                (statistic_id, source, unit_of_measurement, has_mean,
+                 has_sum, name, mean_type, unit_class)
+            VALUES (%s, %s, %s, false, true, %s, 0, 'volume')
+            ON CONFLICT (statistic_id) DO NOTHING
+            """,
+            (statistic_id, source, "m³", "Gas Usage Estimated"),
+        )
+        cur.execute(
+            """
+            SELECT id, source, unit_of_measurement, has_mean, has_sum,
+                   mean_type, unit_class
+            FROM statistics_meta WHERE statistic_id = %s FOR UPDATE
             """,
             (statistic_id,),
         )
-
         row = cur.fetchone()
-
-    if row is None:
-        raise RuntimeError(
-            f"statistics_meta not found: {statistic_id}"
-        )
-
+    if row is None or tuple(row[1:]) != expected:
+        raise RuntimeError(f"incompatible external statistics metadata: {statistic_id}")
     return int(row[0])
 
 
@@ -901,43 +910,24 @@ def upsert_statistics(
     return len(rows)
 
 
-def verify_statistics(
-    conn,
-    metadata_id: int,
-    start_ts: datetime,
-    end_ts: datetime,
-) -> tuple[int, float | None, float | None, float | None, float | None]:
-
+def verify_statistics(conn, metadata_id, points, base_value) -> None:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT
-                COUNT(*),
-                MIN(state),
-                MAX(state),
-                MIN(sum),
-                MAX(sum)
-            FROM statistics
-            WHERE metadata_id = %s
-              AND start_ts >= %s
-              AND start_ts <= %s
+            SELECT start_ts, state, sum FROM statistics
+            WHERE metadata_id = %s AND start_ts >= %s AND start_ts <= %s
+            ORDER BY start_ts
             """,
-            (
-                metadata_id,
-                start_ts.timestamp(),
-                end_ts.timestamp(),
-            ),
+            (metadata_id, points[0].ts.timestamp(), points[-1].ts.timestamp()),
         )
-
-        row = cur.fetchone()
-
-    return (
-        int(row[0]),
-        row[1],
-        row[2],
-        row[3],
-        row[4],
-    )
+        rows = cur.fetchall()
+    if len(rows) != len(points):
+        raise RuntimeError(f"verification failed: expected {len(points)} rows, got {len(rows)}")
+    for row, point in zip(rows, points):
+        expected = (point.ts.timestamp(), point.value, point.value - base_value)
+        if any(actual is None or not math.isclose(float(actual), wanted, rel_tol=0, abs_tol=1e-7)
+               for actual, wanted in zip(row, expected)):
+            raise RuntimeError(f"verification failed at {point.ts.isoformat()}")
 
 
 def commit_statistics(
@@ -946,7 +936,10 @@ def commit_statistics(
     statistic_id: str,
 ) -> None:
 
+    validate_statistic_id(statistic_id)
     hourly_points = validate_hourly_points(points)
+    if hourly_points[0].value < base_value:
+        raise ValueError("meter state is below sum baseline")
 
     conn = connect_postgres()
 
@@ -973,24 +966,7 @@ def commit_statistics(
             base_value,
         )
 
-        count, min_state, max_state, min_sum, max_sum = verify_statistics(
-            conn,
-            metadata_id,
-            hourly_points[0].ts,
-            hourly_points[-1].ts,
-        )
-
-        print()
-        print("Verification")
-        print(f"  rows     : {count}")
-        print(f"  state    : {min_state:.6f} -> {max_state:.6f}")
-        print(f"  sum      : {min_sum:.6f} -> {max_sum:.6f}")
-
-        if count != len(hourly_points):
-            raise RuntimeError(
-                f"verification failed: "
-                f"expected {len(hourly_points)} rows, got {count}"
-            )
+        verify_statistics(conn, metadata_id, hourly_points, base_value)
 
         conn.commit()
 
@@ -1004,106 +980,6 @@ def commit_statistics(
 
     finally:
         conn.close()
-
-
-# ============================================================
-# Home Assistant helper update
-# ============================================================
-
-def update_ha_input_number(
-    entity_id: str,
-    value: float,
-    ha_url: str,
-    ha_token: str,
-) -> None:
-
-    endpoint = (
-        ha_url.rstrip("/")
-        + "/api/services/input_number/set_value"
-    )
-
-    payload = json.dumps(
-        {
-            "entity_id": entity_id,
-            "value": value,
-        }
-    ).encode("utf-8")
-
-    request = urllib.request.Request(
-        endpoint,
-        data=payload,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {ha_token}",
-            "Content-Type": "application/json",
-        },
-    )
-
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=10,
-        ) as response:
-            if response.status < 200 or response.status >= 300:
-                raise RuntimeError(
-                    f"Home Assistant returned HTTP {response.status}"
-                )
-
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode(
-            "utf-8",
-            errors="replace",
-        )
-        raise RuntimeError(
-            f"Home Assistant API error: HTTP {exc.code}: {body}"
-        ) from exc
-
-    except urllib.error.URLError as exc:
-        raise RuntimeError(
-            f"Home Assistant API connection failed: {exc}"
-        ) from exc
-
-
-def maybe_update_ha(
-    args: argparse.Namespace,
-    value: float,
-) -> None:
-
-    if args.skip_ha_update:
-        print()
-        print(
-            "Home Assistant helper update skipped "
-            "(--skip-ha-update)."
-        )
-        return
-
-    ha_token = args.ha_token or os.environ.get("HA_TOKEN")
-
-    if not ha_token:
-        raise RuntimeError(
-            "--commit requires a Home Assistant token to keep the "
-            "current sensor state consistent.\n"
-            "Set HA_TOKEN or use --ha-token.\n"
-            "If you intentionally want DB-only mode, use --skip-ha-update."
-        )
-
-    ha_url = (
-        args.ha_url
-        or os.environ.get("HA_URL")
-        or "http://127.0.0.1:8123"
-    )
-
-    update_ha_input_number(
-        args.helper_entity,
-        value,
-        ha_url,
-        ha_token,
-    )
-
-    print()
-    print("Home Assistant helper updated")
-    print(f"  entity: {args.helper_entity}")
-    print(f"  value : {value:.3f} m3")
 
 
 # ============================================================
@@ -1199,7 +1075,7 @@ def record_mode(
         )
         print(
             "Use --commit to write the interpolated tail "
-            "and update the helper."
+            "to external statistics."
         )
         return 0
 
@@ -1214,12 +1090,6 @@ def record_mode(
         tail_points,
         args.anchor_value,
         args.statistic_id,
-    )
-
-    # current stateは正時補間値ではなく、実測の絶対値を使う。
-    maybe_update_ha(
-        args,
-        latest_observation.value,
     )
 
     return 0
@@ -1329,7 +1199,7 @@ def csv_mode(
         )
         print(
             "Use --commit to write statistics "
-            "and update the helper."
+            "to external statistics."
         )
         return 0
 
@@ -1337,19 +1207,6 @@ def csv_mode(
         points,
         anchor_value,
         args.statistic_id,
-    )
-
-    # 現在値:
-    # CSV終端より後の手動実測があるなら実測値。
-    # なければ最後のCSV確定値。
-    if latest_tail_observation is not None:
-        current_value = latest_tail_observation.value
-    else:
-        current_value = points[-1].value
-
-    maybe_update_ha(
-        args,
-        current_value,
     )
 
     return 0
@@ -1433,49 +1290,16 @@ def main() -> int:
     )
 
     parser.add_argument(
-        "--helper-entity",
-        default=DEFAULT_HELPER_ENTITY,
-        help=(
-            "Home Assistant input_number entity "
-            f"(default: {DEFAULT_HELPER_ENTITY})"
-        ),
-    )
-
-    parser.add_argument(
-        "--ha-url",
-        help=(
-            "Home Assistant base URL. "
-            "Default: HA_URL or http://127.0.0.1:8123"
-        ),
-    )
-
-    parser.add_argument(
-        "--ha-token",
-        help=(
-            "Home Assistant long-lived access token. "
-            "Default: HA_TOKEN environment variable"
-        ),
-    )
-
-    parser.add_argument(
-        "--skip-ha-update",
-        action="store_true",
-        help=(
-            "with --commit, write PostgreSQL only "
-            "and do not update input_number"
-        ),
-    )
-
-    parser.add_argument(
         "--commit",
         action="store_true",
         help=(
             "write generated hourly statistics to PostgreSQL "
-            "and update the Home Assistant helper"
+            "for an external statistic"
         ),
     )
 
     args = parser.parse_args()
+    validate_statistic_id(args.statistic_id)
 
     if looks_like_number(args.target):
         return record_mode(args)

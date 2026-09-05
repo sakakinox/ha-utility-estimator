@@ -74,5 +74,74 @@ class GasTests(unittest.TestCase):
             self.assertEqual(encoding, 'cp932')
 
 
+class DatabaseTests(unittest.TestCase):
+    """Mock the DB boundary; real PostgreSQL compatibility remains a separate check."""
+    def connection(self):
+        from unittest.mock import MagicMock
+        conn = MagicMock()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = (200, 'gas_estimator', 'm³', False, True, 0, 'volume')
+        cur.fetchall.return_value = [(p.ts.timestamp(), p.value, p.value - 412) for p in self.points]
+        return conn, cur
+
+    def setUp(self):
+        self.points = [point('2026-06-25T12:00', 412), point('2026-06-25T13:00', 413)]
+
+    def test_transaction_and_replay(self):
+        from unittest.mock import patch
+        conn, cur = self.connection()
+        with patch.object(gas, 'connect_postgres', return_value=conn):
+            gas.commit_statistics(self.points, 412, gas.DEFAULT_STATISTIC_ID)
+            first = cur.executemany.call_args.args
+            gas.commit_statistics(self.points, 412, gas.DEFAULT_STATISTIC_ID)
+            second = cur.executemany.call_args.args
+        self.assertEqual([r[1:] for r in first[1]], [r[1:] for r in second[1]])
+        self.assertIn('ON CONFLICT (metadata_id, start_ts)', first[0])
+        self.assertEqual(conn.commit.call_count, 2)
+        conn.rollback.assert_not_called()
+        sql = ' '.join(call.args[0] for call in cur.execute.call_args_list)
+        self.assertNotIn('statistics_short_term', sql)
+        self.assertNotIn('sensor.', sql)
+        self.assertIn('ON CONFLICT (statistic_id) DO NOTHING', sql)
+        self.assertFalse(conn.autocommit)
+
+    def test_verification_failure_rolls_back(self):
+        from unittest.mock import patch
+        for rows in [[], [(p.ts.timestamp(), p.value, p.value) for p in self.points]]:
+            conn, cur = self.connection()
+            cur.fetchall.return_value = rows
+            with patch.object(gas, 'connect_postgres', return_value=conn), self.assertRaises(RuntimeError):
+                gas.commit_statistics(self.points, 412, gas.DEFAULT_STATISTIC_ID)
+            conn.commit.assert_not_called()
+            conn.rollback.assert_called_once()
+            conn.close.assert_called_once()
+
+    def test_metadata_mismatch_rolls_back(self):
+        from unittest.mock import patch
+        conn, cur = self.connection()
+        cur.fetchone.return_value = (192, 'recorder', 'm³', False, True, 0, 'volume')
+        with patch.object(gas, 'connect_postgres', return_value=conn), self.assertRaises(RuntimeError):
+            gas.commit_statistics(self.points, 412, gas.DEFAULT_STATISTIC_ID)
+        conn.rollback.assert_called_once()
+        cur.executemany.assert_not_called()
+
+    def test_write_failure_rolls_back(self):
+        from unittest.mock import patch
+        conn, cur = self.connection()
+        cur.executemany.side_effect = RuntimeError('write failed')
+        with patch.object(gas, 'connect_postgres', return_value=conn), self.assertRaises(RuntimeError):
+            gas.commit_statistics(self.points, 412, gas.DEFAULT_STATISTIC_ID)
+        conn.rollback.assert_called_once()
+        conn.commit.assert_not_called()
+
+    def test_entity_id_rejected_before_connection(self):
+        from unittest.mock import patch
+        with patch.object(gas, 'connect_postgres') as connect:
+            for statistic_id in ['sensor.gas_usage_estimated', 'recorder:usage']:
+                with self.assertRaises(ValueError):
+                    gas.commit_statistics(self.points, 412, statistic_id)
+            connect.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()
